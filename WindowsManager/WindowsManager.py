@@ -1,8 +1,13 @@
-from PyQt6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,QMainWindow,QListWidget,QListWidgetItem, QPushButton, QScrollArea, QSpinBox,QTreeWidget,QMenu,QTreeWidgetItem, QMessageBox, QVBoxLayout,QWidget
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor,QAction,QIcon,QPixmap, QImage
-import sys,win32api,win32con,win32gui,os,ctypes
+import sys
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+sys.coinit_flags = 2
+from PyQt6.QtWidgets import QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,QMainWindow,QListWidget,QListWidgetItem, QPushButton, QScrollArea, QSpinBox, QToolBar,QTreeWidget,QMenu,QTreeWidgetItem, QMessageBox, QVBoxLayout,QWidget
+from PyQt6.QtCore import QSize, QThread, Qt, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QColor,QAction,QIcon,QPixmap, QImage, QResizeEvent, QShowEvent
+import sys,win32api,win32con,win32gui,os,ctypes,traceback
 from ctypes import byref, c_int, sizeof, wintypes
+from pywinauto import Desktop
 #窗口大小定义
 w=800
 h=500
@@ -127,6 +132,10 @@ def tool_win(hwnd):
 #---------------DWM----------
 dwmapi = ctypes.windll.dwmapi
 # 定义函数签名
+
+dwmapi.DwmRegisterThumbnail.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.POINTER(wintypes.HANDLE)]
+dwmapi.DwmRegisterThumbnail.restype = ctypes.c_long
+
 DwmSetWindowAttribute = dwmapi.DwmSetWindowAttribute
 DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
 DwmSetWindowAttribute.restype = wintypes.LONG
@@ -191,6 +200,155 @@ def set_animations_disabled(hwnd, disable):
     if result!=0:
         win32api.MessageBox(0, f"出现一个错误，代码：{result}", "错误", win32con.MB_OK)
 #-------------------------------GUI界面实现--------------------------------
+#DWM略缩图
+class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+    _fields_ = [
+        ("dwFlags", wintypes.DWORD),
+        ("rcDestination", wintypes.RECT),
+        ("rcSource", wintypes.RECT),
+        ("opacity", ctypes.c_ubyte),
+        ("fVisible", wintypes.BOOL),
+        ("fSourceClientAreaOnly", wintypes.BOOL),
+    ]
+
+dwmapi.DwmUpdateThumbnailProperties.argtypes = [
+    wintypes.HANDLE, ctypes.POINTER(DWM_THUMBNAIL_PROPERTIES)
+]
+dwmapi.DwmUpdateThumbnailProperties.restype = ctypes.c_long
+
+dwmapi.DwmUnregisterThumbnail.argtypes = [wintypes.HANDLE]
+dwmapi.DwmUnregisterThumbnail.restype = ctypes.c_long
+
+DWM_TNP_RECTDESTINATION        = 0x00000001
+DWM_TNP_VISIBLE                = 0x00000008
+DWM_TNP_OPACITY                = 0x00000004
+DWM_TNP_SOURCECLIENTAREAONLY   = 0x00000010
+
+
+# 宿主窗口
+class DWMThumbnailHost(QMainWindow):
+    def __init__(self, source_hwnd: int, parent=None):
+        super().__init__(parent)
+        self.resize(self.parent().width(),self.parent().height())
+        self.state_label=QLabel()
+        self.state_label.setText("")
+
+        self.is_fscao=False
+        self.source_hwnd = source_hwnd
+        self.thumbnail_handle = wintypes.HANDLE()
+        self._dest_hwnd = 0
+        self._registered = False
+
+        self.setWindowTitle("DWM Thumbnail Host")
+        self.resize(self.parent().width(),self.parent().height())
+
+        self.toolbar = QToolBar("工具", self)
+        self.toolbar.setMovable(False)
+        self.toolbar.setFloatable(False)
+        self.toolbar.setIconSize(QSize(30, 30))
+        self.toolbar.setFixedHeight(30)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+
+        self.hwnd_edit=QLineEdit()
+        self.hwnd_edit.textChanged.connect(self.changeText)
+        self.hwnd_edit.setFixedHeight(25)
+        self.hwnd_edit.setPlaceholderText("输入窗口句柄")
+        self.hwnd_edit.setText(str(source_hwnd))
+        self.toolbar.addWidget(self.hwnd_edit)
+
+        self.fscao=QAction("×：显示窗口非客户区")
+        self.fscao.triggered.connect(self.change_fscao)
+        self.toolbar.addAction(self.fscao)
+
+
+        self.statebar = QToolBar("状态", self)
+        self.statebar.setMovable(False)
+        self.statebar.setFloatable(False)
+        self.statebar.setIconSize(QSize(30, 30))
+        self.statebar.setFixedHeight(30)
+        self.addToolBar(Qt.ToolBarArea.BottomToolBarArea, self.statebar)
+
+        self.state_label=QLabel()
+        self.state_label.setText("......")
+        self.statebar.addWidget(self.state_label)
+        self.show()
+    def change_fscao(self):
+        if self.is_fscao:
+            self.is_fscao=False
+            self.fscao.setText("×：显示窗口非客户区")
+        else:
+            self.is_fscao=True
+            self.fscao.setText("√：显示窗口非客户区")
+        self._update_thumbnail_properties()
+    def changeText(self,text):
+        try:
+            self.source_hwnd=int(text)
+            self._register_thumbnail()
+            self._update_thumbnail_properties()
+        except:
+            self.state_label.setText("语法错误")
+    #生命周期
+    def showEvent(self, event: QShowEvent):
+        super().showEvent(event)
+        # 顶层 QWidget 只有在显示后 winId() 才有效
+        if not self._registered:
+            if not win32gui.IsWindow(self.source_hwnd):
+                self.state_label.setText(f"源窗口句柄无效: {self.source_hwnd}")
+            self._dest_hwnd = int(self.winId())
+            if self._dest_hwnd == self.source_hwnd:
+                self.state_label.setText("源窗口和宿主窗口不能是同一个")
+            self._register_thumbnail()
+            self._update_thumbnail_properties()
+            self._registered = True
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        if self._registered:
+            self._update_thumbnail_properties()
+
+    def closeEvent(self, event: QCloseEvent):
+        if self._registered and self.thumbnail_handle.value:
+            dwmapi.DwmUnregisterThumbnail(self.thumbnail_handle.value)
+            self.thumbnail_handle = wintypes.HANDLE()
+            self._registered = False
+        super().closeEvent(event)
+
+    #DWM 操作
+    def _register_thumbnail(self):
+        hr = dwmapi.DwmRegisterThumbnail(
+            self._dest_hwnd,
+            self.source_hwnd,
+            ctypes.byref(self.thumbnail_handle),
+        )
+        if hr != 0:
+            self.state_label.setText(str(ctypes.WinError(hr)))
+        else:
+            self.state_label.setText(f"缩略图注册成功，句柄: {self.thumbnail_handle.value}")
+
+    def _update_thumbnail_properties(self):
+        # 客户区尺寸：GetClientRect 返回的是物理像素
+        rect = wintypes.RECT()
+        ctypes.windll.user32.GetClientRect(self._dest_hwnd, ctypes.byref(rect))
+
+        props = DWM_THUMBNAIL_PROPERTIES()
+        props.dwFlags = (
+            DWM_TNP_RECTDESTINATION
+            | DWM_TNP_VISIBLE
+            | DWM_TNP_OPACITY
+            | DWM_TNP_SOURCECLIENTAREAONLY
+        )
+
+        cw, ch = rect.right, rect.bottom
+        props.rcDestination = wintypes.RECT(0,40,cw,ch-40)
+        props.opacity = 255
+        props.fVisible = True
+        props.fSourceClientAreaOnly = not self.is_fscao
+
+        hr = dwmapi.DwmUpdateThumbnailProperties(
+            self.thumbnail_handle, ctypes.byref(props)
+        )
+        if hr != 0:
+            self.state_label.setText(str(ctypes.WinError(hr)))
 
 #信息修改器
 class Info_changer(QWidget):
@@ -200,7 +358,7 @@ class Info_changer(QWidget):
             self.destroy()
             return
         self.setWindowTitle(win32gui.GetWindowText(hwnd)+" - 信息修改")
-        self.resize(w,h)
+        self.resize(self.parent().width(),self.parent().height())
         self.setWindowFlags(Qt.WindowType.Window|Qt.WindowType.WindowCloseButtonHint)
         self.hwnd=hwnd
         #主布局
@@ -266,78 +424,114 @@ class Info_changer(QWidget):
                             self.w_edit.value(), self.h_edit.value(), True)
         except Exception as e:
             QMessageBox.information(self,"错误",f"{str(e)}")
+
 #子控件列举器
-def enum_direct_children(hwnd):
-    children = []
-    child = win32gui.FindWindowEx(hwnd, 0, None, None)
-    while child:
-        children.append(child)
+class EnumWorker(QThread):
+    done = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, hwnd, max_depth=30):
+        super().__init__()
+        self.hwnd = hwnd
+        self.max_depth = max_depth
+
+    def run(self):
         try:
-            child = win32gui.FindWindowEx(hwnd, child, None, None)
+            root = Desktop(backend="uia").window(handle=self.hwnd)
+            self.done.emit(self._walk(root, 0))
+        except Exception as e:
+            self.failed.emit(f"{e}\n{traceback.format_exc()}")
+
+    def _walk(self, ctrl, depth):
+        node = self._info(ctrl)
+        if depth < self.max_depth:
+            try:
+                children = ctrl.children()
+            except Exception:
+                children = []
+            node["children"] = [self._walk(c, depth + 1) for c in children]
+        return node
+    @staticmethod
+    def _info(ctrl):
+        try:
+            ei = ctrl.element_info
+            r = ei.rectangle
+            return {"text": ei.name or "",
+                    "type": ei.control_type or "",
+                    "class": ei.class_name or "",
+                    "auto_id": ei.automation_id or "",
+                    "handle": ei.handle,
+                    "rect": (r.left, r.top, r.right, r.bottom),
+                    "children": []}
         except Exception:
-            break  # 窗口可能在枚举过程中被销毁
-    return children
+            return {"text": "<error>", "type": "", "class": "", "auto_id": "",
+                    "handle": 0, "rect": (0, 0, 0, 0), "children": []}
+class WindowInspector(QMainWindow):
+    HEADERS = ["Text", "ControlType", "Class Name", "AutomationId", "HWND"]
 
-
-def safe_get_class(hwnd):
-    try:
-        return win32gui.GetClassName(hwnd)
-    except Exception:
-        return "<已失效>"
-
-
-def safe_get_text(hwnd):
-    try:
-        return win32gui.GetWindowText(hwnd)
-    except Exception:
-        return ""
-
-#子控件列举器
-class WindowInspector(QTreeWidget):
-    def __init__(self, hwnd: int, parent=None):
+    def __init__(self,parent,hwnd):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.Window|Qt.WindowType.WindowCloseButtonHint)
-        self.target_hwnd = hwnd
-        self.hwnd_map = {}  # HWND -> QTreeWidgetItem
+        self.setWindowTitle(f"{win32gui.GetWindowText(hwnd)} - 窗口子控件")
+        self.resize(self.parent().width(),self.parent().height())
 
-        self.setWindowTitle(f"窗口子控件 - {win32gui.GetWindowText(hwnd)}")
-        self.resize(w,h)
+        self.edit = QLineEdit(placeholderText="输入窗口句柄")
+        self.edit.setText(str(hwnd))
+        btn = QPushButton("刷新")
+        btn.clicked.connect(self.on_enum)
+        self.status = QLabel("就绪")
 
-        self.setHeaderLabels(["HWND", "类名 (ClassName)", "文本 (Text)"])
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(self.HEADERS)
+        self.tree.setColumnWidth(0, 320)
 
-        self._populate()
+        top = QHBoxLayout()
+        top.addWidget(self.edit, 1)
+        top.addWidget(btn)
+        lay = QVBoxLayout()
+        lay.addLayout(top)
+        lay.addWidget(self.tree, 1)
+        lay.addWidget(self.status)
+        w = QWidget(); w.setLayout(lay)
+        self.setCentralWidget(w)
+        self.worker = None
+        self.on_enum()
+        self.show()
 
-    #构建根节点
-    def _make_item(self, parent_item, hwnd):
-        item = QTreeWidgetItem(parent_item)
-        item.setText(0, str(hwnd))
-        item.setText(1, safe_get_class(hwnd))
-        item.setText(2, safe_get_text(hwnd))
-        item.setData(0, Qt.ItemDataRole.UserRole, hwnd)
-        return item
-
-    #把 item 作为下一层的 parent
-    def _build_children(self, parent_item, hwnd, depth=0):
-        if depth > 100:
-            return
-        for child in enum_direct_children(hwnd):
-            if child in self.hwnd_map:
-                continue
-            item = self._make_item(parent_item, child)
-            self.hwnd_map[child] = item
-            self._build_children(item, child, depth + 1)
-
-    def _populate(self):
-        self.setUpdatesEnabled(False)
-        self.clear()
-        self.hwnd_map.clear()
+    def on_enum(self):
         try:
-            root = self._make_item(self, self.target_hwnd)
-            self.hwnd_map[self.target_hwnd] = root
-            self._build_children(root, self.target_hwnd)
-            self.expandToDepth(2)
-        finally:
-            self.setUpdatesEnabled(True)
+            hwnd = int(self.edit.text().strip(), 0)
+        except ValueError:
+            self.status.setText("HWND 格式错误")
+            return
+        if self.worker and self.worker.isRunning():
+            return
+        self.status.setText("枚举中…")
+        self.worker = EnumWorker(hwnd)
+        self.worker.done.connect(self.fill_tree)
+        self.worker.failed.connect(lambda m: self.status.setText("失败：" + m.splitlines()[0]))
+        self.worker.start()
+
+    def fill_tree(self, data: dict):
+        self.tree.clear()
+        root_item = QTreeWidgetItem([data["text"], data["type"],
+                                     data["class"], data["auto_id"], str(data["handle"])])
+        self.tree.addTopLevelItem(root_item)
+
+        def add(node, parent):
+            for ch in node["children"]:
+                it = QTreeWidgetItem([
+                    ch["text"], 
+                    ch["type"],
+                    ch["class"], 
+                    ch["auto_id"], 
+                    str(ch["handle"]),
+                ])
+                parent.addChild(it)
+                add(ch, it)
+
+        add(data, root_item)
+        self.tree.expandToDepth(1)
+        self.status.setText(f"共 {self.tree.topLevelItemCount()} 个顶层根节点")
 #获取图标工具
 def get_window_icon(hwnd: int) -> QIcon:
     hicon = 0
@@ -422,7 +616,7 @@ class attribute_editor(QListWidget):
             return
         self.setWindowTitle(win32gui.GetWindowText(hwnd)+" - Attributes Editor - 双击选项更改")
         self.setWindowFlags(Qt.WindowType.Window|Qt.WindowType.WindowCloseButtonHint)
-        self.resize(w,h)
+        self.resize(self.parent().width(),self.parent().height())
 
         all_ws = [name for name in dir(win32con) if name.isupper() and name[:3]=="WS_"]
         for i in all_ws:
@@ -456,6 +650,7 @@ class WMenu(QMenu):
         self.hwnd=hwnd
         self.atw=None
         self.lis=None
+        self.dws=None
 
         self.pu_tong=QMenu("普通操作")
         self.addMenu(self.pu_tong)
@@ -515,8 +710,9 @@ class WMenu(QMenu):
         self.attribu_set=QAction("所有属性")
         self.show_lis=QAction("查看子控件")
         self.cha_info=QAction("信息更改")
+        self.dwm_show=QAction("DWM略缩图")
 
-        self.addActions([self.attribu_set,self.show_lis,self.cha_info])
+        self.addActions([self.attribu_set,self.show_lis,self.cha_info,self.dwm_show])
         self.pu_tong.addActions([self.max_action,self.min_action,self.nor_action,self.clo_action])
         self.shu_xing.addActions([self.aot_action,self.has_titlea,self.min_sh_act,self.max_sh_act,self.hel_sh_act,self.can_cg_act,self.toolwin_ac])
         self.max_action.triggered.connect(lambda checked=False:show_max(self.hwnd))
@@ -533,10 +729,14 @@ class WMenu(QMenu):
         self.attribu_set.triggered.connect(self.att)
         self.show_lis.triggered.connect(self.show_lis_a)
         self.cha_info.triggered.connect(self.show_info_c)
+        self.dwm_show.triggered.connect(self.ds)
     def att(self):
         if self.hwnd:
             self.atw=attribute_editor(parent=self.parent(),hwnd=self.hwnd)
             self.atw.show()
+    def ds(self):
+        if self.hwnd:
+            self.dws=DWMThumbnailHost(self.hwnd,self.parent())
     def show_lis_a(self):
         if self.hwnd:
             self.lis=WindowInspector(parent=self.parent(),hwnd=self.hwnd)
@@ -581,8 +781,7 @@ class Win(QMainWindow):
         self.setWindowTitle("WindowsManager - HCT")
         self.resize(w,h)
         #菜单项
-        menubar = self.menuBar() 
-        menubar.setStyleSheet("background:white;")
+        menubar = self.menuBar()
         #文件菜单
         self.fileMenu=QMenu("文件")
         self.restart_as_admin=QAction("以管理员身份重启")
